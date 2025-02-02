@@ -465,6 +465,13 @@ const pullDataFromHubspot = async () => {
     }
 
     try {
+      await processMeetings(domain, account.hubId, q);
+      console.log('process meetings');
+    } catch (err) {
+      console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processCompanies', hubId: account.hubId } });
+    }
+
+    try {
       await drainQueue(domain, actions, q);
       console.log('drain queue');
     } catch (err) {
