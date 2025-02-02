@@ -261,6 +261,153 @@ const processContacts = async (domain, hubId, q) => {
   return true;
 };
 
+/////////////////////////////////
+/// Orlando Saavedra method
+/////////////////////////////////
+/**
+ * Get recently modified meetings as 100 meetings per page
+ */
+const processMeetings = async (domain, hubId, q) => {
+  const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId);
+  // Note: Debuging the account.lastPulledDates.meetings is `undefined` due to the
+  //       constructor name is `Document` and does not have the key `meetings`. Accounts and
+  //       Companies are okay, are returned in `Object.key(account.lastPulledDates)
+  //       That's why I reconstruct the full object to get the meeeting value
+  const safeLastPulledDates = JSON.parse(JSON.stringify(account.lastPulledDates));
+
+  const lastPulledDate = new Date(safeLastPulledDates.meetings);
+  const now = new Date();
+
+  let hasMore = true;
+  const offsetObject = {};
+  const limit = 100;
+
+  while (hasMore) {
+    const lastModifiedDate = offsetObject.lastModifiedDate || lastPulledDate;
+    const lastModifiedDateFilter = generateLastModifiedDateFilter(lastModifiedDate, now, 'hs_lastmodifieddate');
+    const searchObject = {
+      filterGroups: [lastModifiedDateFilter],
+      sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'ASCENDING' }],
+      properties: [
+        'hs_timestamp',
+        'hs_meeting_title',
+      ],
+      limit,
+      after: offsetObject.after
+    };
+    let searchResult = {};
+
+    let tryCount = 0;
+    while (tryCount <= 4) {
+      try {
+        searchResult = await hubspotClient.crm.objects.meetings.searchApi.doSearch(searchObject);
+        break;
+      } catch (err) {
+        console.log(`[processMeetings] Failed getting meetings from API: ${err}`)
+        tryCount++;
+
+        if (new Date() > expirationDate) await refreshAccessToken(domain, hubId);
+
+        await new Promise((resolve, reject) => setTimeout(resolve, 5000 * Math.pow(2, tryCount)));
+        console.log(`[processMeetings] Attempt number ${tryCount}`);
+      }
+    }
+
+    if (!searchResult) throw new Error('Failed to fetch meetings for the 4th time. Aborting.');
+
+    const data = searchResult.results || [];
+    offsetObject.after = parseInt(searchResult?.paging?.next?.after);
+
+    console.log('[processMeetings] Fetch meeting batch');
+    const meetingIds = data.map(meeting => meeting.id);
+    const meetingActions = data.map(meeting => {
+      if (!meeting.properties) return;
+
+      const isCreated = new Date(meeting.createdAt) > lastPulledDate;
+      return {
+        actionName: isCreated ? "Meeting Created" : "Meeting Updated",
+        actionDate: new Date(isCreated ? meeting.createdAt : meeting.updatedAt),
+        userProperties: {
+          meeting_title: meeting.properties.hs_meeting_title,
+          meeting_id: meeting.id,
+          meeting_created_at: meeting.createdAt,
+          meeting_updated_at: meeting.updatedAt,
+        }
+      };
+    });
+
+    // Fetch contact associations for each meeting
+    const contactAssociationsResults = await hubspotClient.apiRequest({
+      method: 'post',
+      path: '/crm/v3/associations/MEETINGS/CONTACTS/batch/read',
+      body: {
+        inputs: meetingIds.map(id => ({ id })),
+        associationCategory: "HUBSPOT_DEFINED",
+        // Right association type for meetings ↔ contacts
+        associationTypeId: 27
+      }
+    });
+
+    const contactAssociations = (await contactAssociationsResults.json())?.results || [];
+    console.log("[processMeetings] Contact associations fetched:", contactAssociations);
+
+    // Retrieve contact emails
+    const contactIds = contactAssociations.map(ca => ca.to[0]?.id).filter(Boolean);
+    if (!contactIds.length) {
+      console.log("[processMeetings] No contact IDs found for meetings.");
+    }else{
+      const contactDetailsResults = await hubspotClient.apiRequest({
+        method: 'post',
+        path: '/crm/v3/objects/contacts/batch/read',
+        body: {
+          properties: ["email"],
+          inputs: contactIds.map(id => ({ id }))
+        }
+      });
+
+      const contactsData = (await contactDetailsResults.json())?.results || [];
+      console.log("[processMeetings] Raw Contacts Response:", JSON.stringify(contactsData, null, 2));
+
+      // Map contact IDs to emails
+      const contactEmails = Object.fromEntries(
+        contactsData.map(contact => [contact.id, contact.properties.email])
+      );
+
+      // Step 4: Append emails to meeting actions
+      meetingActions.forEach(action => {
+        const meetingId = action.userProperties.meeting_id;
+        const associatedContactId = contactAssociations.find(a => a.from.id === meetingId)?.to?.[0]?.id;
+        if(!contactEmails[associatedContactId]){
+          console.log("[processMeetings] Contact email not found. Skipping...");
+          return;
+        }
+        action.userProperties.contact_email = contactEmails[associatedContactId];
+      });
+
+      console.log("[processMeetings] Final meeting actions with emails:", meetingActions);
+    }
+
+    // Push actions to queue
+    meetingActions.forEach(action => q.push(action));
+
+    if (!offsetObject?.after) {
+      hasMore = false;
+      break;
+    } else if (offsetObject?.after >= 9900) {
+      offsetObject.after = 0;
+      offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
+    }
+  }
+
+  account.lastPulledDates.contacts = now;
+  await saveDomain(domain);
+
+  return true;
+};
+/////////////////////////////////
+/// End Method
+/////////////////////////////////
+
 const createQueue = (domain, actions) => queue(async (action, callback) => {
   actions.push(action);
 
