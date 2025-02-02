@@ -13,8 +13,8 @@ const generateLastModifiedDateFilter = (date, nowDate, propertyName = 'hs_lastmo
   const lastModifiedDateFilter = date ?
     {
       filters: [
-        { propertyName, operator: 'GTQ', value: `${date.valueOf()}` },
-        { propertyName, operator: 'LTQ', value: `${nowDate.valueOf()}` }
+        { propertyName, operator: 'GT', value: `${date.valueOf()}` },
+        { propertyName, operator: 'LT', value: `${nowDate.valueOf()}` }
       ]
     } :
     {};
@@ -197,7 +197,6 @@ const processContacts = async (domain, hubId, q) => {
     if (!searchResult) throw new Error('Failed to fetch contacts for the 4th time. Aborting.');
 
     const data = searchResult.results || [];
-
     console.log('fetch contact batch');
 
     offsetObject.after = parseInt(searchResult.paging?.next?.after);
